@@ -409,6 +409,6 @@ if __name__ == "__main__":
             js_api=_Bridge(),
             width=1200, height=800, min_size=(900, 600),
         )
-        webview.start()
+        webview.start(debug=bool(os.environ.get("CLEANAGENT_DEBUG")))
     else:
         _run_server_with_browser()
