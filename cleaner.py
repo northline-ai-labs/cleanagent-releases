@@ -321,47 +321,62 @@ class SystemCleaner:
         files_cleaned = 0
         space_freed = 0
 
-        # pip cache
-        pip_cmd = "pip3" if not self.is_win else "pip"
-        try:
-            result = subprocess.run(
-                [pip_cmd, "cache", "purge"],
-                capture_output=True, timeout=30,
-                creationflags=_NO_WINDOW if self.is_win else 0,
-            )
-            if result.returncode == 0:
-                files_cleaned += 1
-        except Exception:
-            pass
+        def _folder_size(p: Path) -> int:
+            total = 0
+            for f in p.rglob("*"):
+                try:
+                    if f.is_file() and not f.is_symlink():
+                        total += f.stat().st_size
+                except OSError:
+                    pass
+            return total
 
-        # Homebrew cache (Mac only)
-        if self.is_mac:
-            try:
-                result = subprocess.run(
-                    ["brew", "cleanup", "--prune=all", "-s"],
-                    capture_output=True, timeout=60,
-                )
-                if result.returncode == 0:
+        def _wipe(p: Path) -> None:
+            nonlocal files_cleaned, space_freed
+            if p.exists():
+                size = _folder_size(p)
+                shutil.rmtree(p, ignore_errors=True)
+                if not p.exists():
                     files_cleaned += 1
-            except Exception:
-                pass
+                    space_freed += size
 
-        # npm cache (cross-platform)
-        try:
-            result = subprocess.run(
-                ["npm", "cache", "clean", "--force"],
-                capture_output=True, timeout=30,
-                creationflags=_NO_WINDOW if self.is_win else 0,
-            )
-            if result.returncode == 0:
-                files_cleaned += 1
-        except Exception:
-            pass
+        # pip cache: delete the folder directly. Never run pip/pip3:
+        # on Macs without developer tools, /usr/bin/pip3 triggers an install prompt.
+        if self.is_win:
+            _wipe(Path(os.environ.get("LOCALAPPDATA", "")) / "pip" / "Cache")
+        else:
+            _wipe(Path.home() / "Library" / "Caches" / "pip")
+
+        # npm cache: delete the folder directly
+        if self.is_win:
+            _wipe(Path(os.environ.get("LOCALAPPDATA", "")) / "npm-cache" / "_cacache")
+        else:
+            _wipe(Path.home() / ".npm" / "_cacache")
+
+        # Homebrew: only if actually installed (GUI apps may not inherit PATH)
+        if self.is_mac:
+            brew = shutil.which("brew") or next(
+                (b for b in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew")
+                 if Path(b).exists()), None)
+            if brew:
+                cache = Path.home() / "Library" / "Caches" / "Homebrew"
+                before = _folder_size(cache) if cache.exists() else 0
+                try:
+                    result = subprocess.run(
+                        [brew, "cleanup", "--prune=all", "-s"],
+                        capture_output=True, timeout=120,
+                    )
+                    if result.returncode == 0:
+                        files_cleaned += 1
+                        after = _folder_size(cache) if cache.exists() else 0
+                        space_freed += max(0, before - after)
+                except Exception:
+                    pass
 
         r = CleanupResult(
             "package_caches", "Package Caches (pip/brew/npm)",
             files_cleaned, space_freed, True,
-            "Purged package manager caches",
+            f"Cleared {files_cleaned} package caches ({fmt_size(space_freed)})",
         )
         self.results.append(r)
         return r
@@ -521,3 +536,125 @@ class SystemCleaner:
             "space_freed_display": fmt_size(freed),
             "errors": errors,
         }
+    @staticmethod
+    def archive_files(file_paths: List[str], dest_dir: str, delete_originals: bool = False) -> Dict:
+        """
+        Archive a list of files into a single timestamped ZIP at dest_dir.
+        Optionally delete the originals after a successful archive.
+        """
+        import zipfile
+
+        dest = Path(dest_dir).expanduser()
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+        except (PermissionError, OSError) as e:
+            return {"success": False, "error": f"Cannot write to {dest}: {e}"}
+
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        zip_path = dest / f"cleanagent-archive-{ts}.zip"
+
+        archived = 0
+        skipped = []
+        total_bytes = 0
+        seen_names = {}
+
+        try:
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+                for fp in file_paths:
+                    p = Path(fp)
+                    if not p.exists() or not p.is_file():
+                        skipped.append(p.name or fp)
+                        continue
+                    try:
+                        # Avoid name collisions by suffixing duplicates
+                        arcname = p.name
+                        if arcname in seen_names:
+                            seen_names[arcname] += 1
+                            stem, dot, ext = arcname.rpartition(".")
+                            arcname = (
+                                f"{stem}_{seen_names[p.name]}.{ext}"
+                                if dot else f"{arcname}_{seen_names[p.name]}"
+                            )
+                        else:
+                            seen_names[arcname] = 0
+                        zf.write(p, arcname=arcname)
+                        total_bytes += p.stat().st_size
+                        archived += 1
+                    except (PermissionError, OSError) as e:
+                        skipped.append(f"{p.name}: {e}")
+        except Exception as e:
+            return {"success": False, "error": f"Archive failed: {e}"}
+
+        deleted = 0
+        delete_errors = []
+        if delete_originals and archived > 0:
+            for fp in file_paths:
+                p = Path(fp)
+                if not p.exists() or not p.is_file():
+                    continue
+                try:
+                    p.unlink()
+                    deleted += 1
+                except (PermissionError, OSError) as e:
+                    delete_errors.append(f"{p.name}: {e}")
+
+        return {
+            "success": True,
+            "zip_path": str(zip_path),
+            "archived": archived,
+            "skipped": skipped,
+            "deleted_originals": deleted,
+            "delete_errors": delete_errors,
+            "total_bytes": total_bytes,
+            "total_display": fmt_size(total_bytes),
+        }
+
+    @staticmethod
+    def pick_folder(initial_dir: str = None) -> Dict:
+        """Open a native folder picker via AppleScript (Mac) or PowerShell (Windows)."""
+        is_mac = platform.system() == "Darwin"
+        is_win = platform.system() == "Windows"
+        try:
+            if is_mac:
+                script = (
+                    'try\n'
+                    '  set chosenFolder to choose folder with prompt "Choose where to save the CleanAgent archive"\n'
+                    '  POSIX path of chosenFolder\n'
+                    'on error number -128\n'
+                    '  return "CANCELLED"\n'
+                    'end try'
+                )
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=120,
+                )
+                out = (result.stdout or "").strip()
+                if not out or out == "CANCELLED":
+                    return {"success": False, "cancelled": True}
+                return {"success": True, "path": out.rstrip("/")}
+
+            elif is_win:
+                ps = (
+                    "Add-Type -AssemblyName System.Windows.Forms; "
+                    "$f = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                    "$f.Description = 'Choose where to save the CleanAgent archive'; "
+                    "$f.ShowNewFolderButton = $true; "
+                    "if ($f.ShowDialog() -eq 'OK') { Write-Output $f.SelectedPath } "
+                    "else { Write-Output 'CANCELLED' }"
+                )
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-STA", "-Command", ps],
+                    capture_output=True, text=True, timeout=120,
+                    creationflags=_NO_WINDOW,
+                )
+                out = (result.stdout or "").strip()
+                if not out or out == "CANCELLED":
+                    return {"success": False, "cancelled": True}
+                return {"success": True, "path": out}
+
+            else:
+                # Linux fallback: default to ~/Documents
+                default = str(Path.home() / "Documents")
+                return {"success": True, "path": default}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
