@@ -273,12 +273,103 @@ def open_browser():
     webbrowser.open("http://127.0.0.1:5000")
 
 
+@app.route("/api/archive/pick-folder", methods=["POST"])
+def archive_pick_folder():
+    """Open native folder picker; return chosen path."""
+    result = SystemCleaner.pick_folder()
+    return jsonify(result)
+
+
+# Background archive job state
+_archive_jobs = {}
+_archive_lock = threading.Lock()
+
+@app.route("/api/archive", methods=["POST"])
+def archive_files():
+    """Start an archive job in a background thread."""
+    import uuid
+    data = request.get_json(silent=True) or {}
+    paths = data.get("paths", [])
+    dest = data.get("dest", "")
+    delete_originals = bool(data.get("delete_originals", False))
+
+    if not paths:
+        return jsonify({"success": False, "error": "No files selected"}), 400
+    if not dest:
+        return jsonify({"success": False, "error": "No destination provided"}), 400
+
+    job_id = uuid.uuid4().hex
+    with _archive_lock:
+        _archive_jobs[job_id] = {"status": "running", "result": None}
+
+    def worker():
+        try:
+            result = SystemCleaner.archive_files(paths, dest, delete_originals=delete_originals)
+            with _archive_lock:
+                _archive_jobs[job_id] = {"status": "done", "result": result}
+        except Exception as e:
+            with _archive_lock:
+                _archive_jobs[job_id] = {"status": "done", "result": {"success": False, "error": str(e)}}
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({"success": True, "job_id": job_id})
+
+
+@app.route("/api/archive/status/<job_id>", methods=["GET"])
+def archive_status(job_id):
+    with _archive_lock:
+        job = _archive_jobs.get(job_id)
+    if not job:
+        return jsonify({"status": "unknown"}), 404
+    return jsonify(job)
+
+
+def _free_port() -> int:
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _wait_for_server(url: str, timeout: float = 15) -> bool:
+    import time, urllib.request, urllib.error
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(url, timeout=1)
+            return True
+        except urllib.error.HTTPError:
+            return True          # server is up, route just returned an error code
+        except Exception:
+            time.sleep(0.2)
+    return False
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    log.info(f"CleanAgent v2.0 starting on http://127.0.0.1:{port}")
+    # Avoid port 5000: macOS AirPlay Receiver uses it on many Macs
+    port = int(os.environ.get("PORT", 0)) or _free_port()
+    url = f"http://127.0.0.1:{port}"
+    log.info(f"CleanAgent starting on {url}")
 
-    # Auto-open browser (only in production / exe mode, not during dev reload)
-    if not os.environ.get("WERKZEUG_RUN_MAIN"):
-        threading.Thread(target=open_browser, daemon=True).start()
+    server = threading.Thread(
+        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
+        daemon=True,
+    )
+    server.start()
+    _wait_for_server(url)
 
-    app.run(host="127.0.0.1", port=port, debug=False)
+    try:
+        import webview
+    except ImportError:
+        webview = None
+
+    if webview:
+        # Native app window; closing it quits CleanAgent (server thread is a daemon)
+        webview.create_window("CleanAgent", url, width=1200, height=800, min_size=(900, 600))
+        webview.start()
+    else:
+        log.warning("pywebview not installed; falling back to browser")
+        webbrowser.open(url)
+        server.join()
