@@ -450,6 +450,81 @@ class SystemScanner:
         return sorted(out, key=lambda x: x["cpu_percent"] + x["memory_percent"], reverse=True)[:limit]
 
 
+    # ── App last-used detection (Mac) ────────────────────
+    def _running_mac_apps(self) -> set:
+        """Names of .app bundles running right now."""
+        names = set()
+        try:
+            for p in psutil.process_iter(["exe"]):
+                exe = p.info.get("exe") or ""
+                i = exe.find(".app/")
+                if i != -1:
+                    names.add(Path(exe[:i + 4]).stem)
+        except Exception:
+            pass
+        return names
+
+    def _mac_last_used(self, app_path: Path, running: set):
+        """Return (datetime or None, display text). Uses the most recent of:
+        running now, Spotlight last-used date, and app data folder activity."""
+        if app_path.stem in running:
+            return datetime.now(), "In use now"
+
+        stamps = []
+
+        # Spotlight (often empty on managed/work Macs)
+        try:
+            r = subprocess.run(
+                ["mdls", "-name", "kMDItemLastUsedDate", "-raw", str(app_path)],
+                capture_output=True, text=True, timeout=5,
+            )
+            ds = r.stdout.strip()
+            if ds and ds != "(null)":
+                lu = datetime.strptime(ds[:25], "%Y-%m-%d %H:%M:%S %z")
+                stamps.append(lu.astimezone().replace(tzinfo=None).timestamp())
+        except Exception:
+            pass
+
+        # App data folders, located via the bundle ID
+        bundle_id = None
+        try:
+            import plistlib
+            with open(app_path / "Contents" / "Info.plist", "rb") as fh:
+                bundle_id = plistlib.load(fh).get("CFBundleIdentifier")
+        except Exception:
+            pass
+
+        lib = self.home / "Library"
+        candidates = [lib / "Application Support" / app_path.stem]
+        if bundle_id:
+            candidates += [
+                lib / "Containers" / bundle_id / "Data" / "Library" / "Preferences",
+                lib / "Containers" / bundle_id / "Data" / "Library" / "Caches",
+                lib / "Preferences" / f"{bundle_id}.plist",
+                lib / "Caches" / bundle_id,
+                lib / "Application Support" / bundle_id,
+                lib / "HTTPStorages" / bundle_id,
+                lib / "Saved Application State" / f"{bundle_id}.savedState",
+            ]
+        for c in candidates:
+            try:
+                stamps.append(c.stat().st_mtime)
+                if c.is_dir():
+                    for n, child in enumerate(c.iterdir()):
+                        if n >= 200:
+                            break
+                        try:
+                            stamps.append(child.stat().st_mtime)
+                        except OSError:
+                            pass
+            except OSError:
+                continue
+
+        if stamps:
+            lu = datetime.fromtimestamp(max(stamps))
+            return lu, lu.strftime("%Y-%m-%d")
+        return None, "Not tracked"
+
     # ── Installed Apps Analysis ──────────────────────────
     def scan_installed_apps(self) -> List[Dict]:
         """Scan installed applications with size and last-used date."""
@@ -457,6 +532,7 @@ class SystemScanner:
 
         if self.is_mac:
             app_dirs = [Path("/Applications"), self.home / "Applications"]
+            running_apps = self._running_mac_apps()
             for app_dir in app_dirs:
                 if not app_dir.exists():
                     continue
@@ -470,20 +546,8 @@ class SystemScanner:
                             size = self._dir_size(item)
                             if size < 1024 * 1024:
                                 continue
-                            last_used_str = "Unknown"
-                            days_unused = -1
-                            try:
-                                result = subprocess.run(
-                                    ["mdls", "-name", "kMDItemLastUsedDate", "-raw", str(item)],
-                                    capture_output=True, text=True, timeout=5,
-                                )
-                                ds = result.stdout.strip()
-                                if ds and ds != "(null)":
-                                    lu = datetime.strptime(ds[:19], "%Y-%m-%d %H:%M:%S")
-                                    last_used_str = lu.strftime("%Y-%m-%d")
-                                    days_unused = (datetime.now() - lu).days
-                            except Exception:
-                                pass
+                            lu, last_used_str = self._mac_last_used(item, running_apps)
+                            days_unused = max(0, (datetime.now() - lu).days) if lu else -1
                             apps.append({
                                 "name": item.stem,
                                 "path": str(item),

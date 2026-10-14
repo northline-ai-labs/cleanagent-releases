@@ -167,7 +167,12 @@
         .fade-up{animation:fadeUp .5s ease forwards}
         @keyframes spin{to{transform:rotate(360deg)}}
         .spinner{display:inline-block;width:18px;height:18px;border:2px solid var(--bdr);border-top-color:var(--grn);border-radius:50%;animation:spin .8s linear infinite;vertical-align:middle;margin-right:8px}
-    </style>
+    
+.btn-sm{padding:6px 12px;font-size:.78rem;border-radius:6px;border:1px solid var(--bd);background:var(--bg2);color:var(--t1);cursor:pointer;transition:all .15s}
+.btn-sm:hover{background:var(--bg3);border-color:var(--t3)}
+.btn-sm.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.btn-sm.btn-primary:hover{filter:brightness(1.1)}
+</style>
 </head>
 <body>
 <div class="app">
@@ -240,7 +245,7 @@
             <div class="app-filter-bar">
                 <button class="app-filter-btn active" onclick="filterApps('all')">All Apps</button>
                 <button class="app-filter-btn" onclick="filterApps('unused')">Unused (6+ months)</button>
-                <button class="app-filter-btn" onclick="filterApps('unknown')">Unknown Status</button>
+                <button class="app-filter-btn" onclick="filterApps('unknown')">Not Tracked</button>
                 <button class="app-filter-btn" onclick="filterApps('active')">Recently Used</button>
             </div>
             <div class="file-list">
@@ -288,6 +293,15 @@
     <div class="modal"><h3>🧹 Delete Old Downloads?</h3>
     <p>This will permanently delete the <strong id="dl-count">0</strong> selected files from your Downloads folder. This cannot be undone.</p>
     <div class="modal-actions"><button class="modal-cancel" onclick="closeModal('modal-dl')">Cancel</button><button class="modal-danger" onclick="deleteOldDownloads()">Delete Selected</button></div></div>
+</div>
+
+
+<div class="modal-overlay" id="modal-archive">
+    <div class="modal"><h3>📦 Archive to ZIP</h3>
+    <p><span id="archive-count">0</span> files (<span id="archive-size">0 MB</span>) will be compressed into a single ZIP at:</p>
+    <div id="archive-dest" style="font-size:.78rem;color:var(--t3);margin:8px 0 16px;word-break:break-all;font-family:monospace"></div>
+    <div style="margin-bottom:18px"><label style="display:flex;align-items:center;gap:8px;font-size:.85rem;cursor:pointer"><input type="checkbox" id="archive-delete-orig"> Delete original files after archiving</label></div>
+    <div class="modal-actions"><button class="modal-cancel" onclick="closeModal('modal-archive')">Cancel</button><button class="modal-confirm" onclick="runArchive()">Create Archive</button></div></div>
 </div>
 
 <div class="toast" id="toast"></div>
@@ -405,15 +419,12 @@ function render(d){
     el('cache-list').innerHTML=d.caches.large_caches.length?d.caches.large_caches.map(c=>fileRow(c.name,'',c.size_display)).join(''):emptyRow('No large cache directories found');
 
     el('large-badge').textContent=d.large_files.length+' files';
-    el('large-list').innerHTML=d.large_files.length?d.large_files.slice(0,10).map(f=>fileRow(f.name,f.location+' · '+f.modified,f.size_display)).join(''):emptyRow('No files over 100 MB found');
+    el('large-list').innerHTML=d.large_files.length?d.large_files.slice(0,10).map((f,i)=>archiveRow('lf',i,f.path,f.name,f.location+' · '+f.modified,f.size_display,f.size_mb)).join('')+archiveBar('lf'):emptyRow('No files over 100 MB found');
 
     const wt=d.duplicates.reduce((s,x)=>s+x.wasted_mb,0).toFixed(1);
     el('dup-badge').textContent=d.duplicates.length+' groups · '+wt+' MB wasted';
     el('dup-del-btn').style.display=d.duplicates.length>0?'inline-block':'none';
-    el('dup-list').innerHTML=d.duplicates.length?d.duplicates.map(x=>`
-        <div class="file-row"><span class="file-name">${x.files[0].name} <span style="color:var(--t3)">(×${x.count})</span>
-        <span style="color:var(--t3);font-size:.75rem;margin-left:8px">keeps: ${x.files[0].location}</span></span>
-        <span class="file-size rose">${x.wasted_display||x.wasted_mb+' MB'}</span></div>`).join(''):emptyRow('No duplicates detected');
+    el('dup-list').innerHTML=d.duplicates.length?d.duplicates.map((g,gi)=>{const files=g.files||[];return files.slice(1).map((f,fi)=>archiveRow('dup',gi+'_'+fi,f.path,f.name||g.name,'Duplicate of '+(files[0].name||g.name),fmtMB(f.size_mb||g.wasted_mb/Math.max(1,files.length-1)),f.size_mb||0)).join('');}).join('')+archiveBar('dup'):emptyRow('No duplicates detected');
 
     const dl=d.downloads, old=dl.old_files||[];
     el('dl-badge').textContent=dl.file_count+' files · '+(dl.total_display||dl.total_size_mb+' MB');
@@ -473,6 +484,72 @@ async function runCleanup(){
             showToast('✅ Cleanup complete! Run another scan to see full results.');
         }
     }catch(e){btn.textContent='❌ Cleanup Failed'}
+}
+
+
+// ── Archive helpers ────────────────────────
+function archiveRow(prefix,idx,path,name,sub,sizeDisplay,sizeMB){
+  return `<div class="file-row"><label style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer;min-width:0">
+    <input type="checkbox" class="${prefix}-check" data-path="${encodeURIComponent(path)}" data-size="${sizeMB}">
+    <div style="flex:1;min-width:0"><div class="file-name">${name}</div><div class="file-sub">${sub}</div></div>
+    <span class="file-size">${sizeDisplay}</span></label></div>`;
+}
+function archiveBar(prefix){
+  return `<div style="display:flex;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">
+    <button class="btn-sm" onclick="selectAll('${prefix}',true)">Select all</button>
+    <button class="btn-sm" onclick="selectAll('${prefix}',false)">Clear</button>
+    <button class="btn-sm btn-primary" onclick="confirmArchive('${prefix}')" style="margin-left:auto">📦 Archive selected to ZIP</button>
+  </div>`;
+}
+function selectAll(prefix,checked){
+  document.querySelectorAll('.'+prefix+'-check').forEach(c=>c.checked=checked);
+}
+let _archiveCtx=null;
+async function confirmArchive(prefix){
+  const checked=document.querySelectorAll('.'+prefix+'-check:checked');
+  if(!checked.length){showToast('No files selected');return}
+  const paths=[...checked].map(c=>decodeURIComponent(c.dataset.path));
+  const totalMB=[...checked].reduce((s,c)=>s+parseFloat(c.dataset.size||0),0);
+  showToast('Opening folder picker...');
+  let pick;
+  try{pick=await(await fetch('/api/archive/pick-folder',{method:'POST'})).json();}
+  catch(e){showToast('❌ Could not open folder picker');return}
+  if(!pick.success){if(!pick.cancelled)showToast('❌ '+(pick.error||'Folder picker failed'));return}
+  _archiveCtx={paths,dest:pick.path};
+  el('archive-count').textContent=paths.length;
+  el('archive-size').textContent=fmtMB(totalMB);
+  el('archive-dest').textContent=pick.path;
+  el('archive-delete-orig').checked=false;
+  openModal('modal-archive');
+}
+async function runArchive(){
+  if(!_archiveCtx)return;
+  const deleteOrig=el('archive-delete-orig').checked;
+  closeModal('modal-archive');
+  showToast('Creating archive... this may take a few minutes for large files');
+  try{
+    const start=await(await fetch('/api/archive',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({paths:_archiveCtx.paths,dest:_archiveCtx.dest,delete_originals:deleteOrig})})).json();
+    if(!start.success||!start.job_id){showToast('❌ '+(start.error||'Could not start archive'));_archiveCtx=null;return}
+    const jobId=start.job_id;
+    const poll=async()=>{
+      try{
+        const s=await(await fetch('/api/archive/status/'+jobId)).json();
+        if(s.status==='done'){
+          const r=s.result||{};
+          if(r.success){
+            let msg=`✅ Archived ${r.archived} files (${r.total_display})`;
+            if(deleteOrig)msg+=` · ${r.deleted_originals} originals deleted`;
+            showToast(msg);
+          }else{showToast('❌ '+(r.error||'Archive failed'))}
+          _archiveCtx=null;
+        }else{
+          setTimeout(poll,1500);
+        }
+      }catch(e){showToast('❌ Status check failed');_archiveCtx=null}
+    };
+    setTimeout(poll,1500);
+  }catch(e){showToast('❌ Archive request failed');_archiveCtx=null}
 }
 
 // ── Delete Duplicates ──────────────────────
@@ -554,11 +631,11 @@ function filterApps(filter){
     list.innerHTML = filtered.map(a => {
         let sc = 'active', st = 'Active';
         if(a.is_unused){ sc = 'unused'; st = 'Unused'; }
-        else if(a.is_unknown){ sc = 'unknown'; st = 'Unknown'; }
+        else if(a.is_unknown){ sc = 'unknown'; st = 'Not tracked'; }
         const lu = a.days_unused > 0 ? a.last_used + ' (' + a.days_unused + 'd)' : a.last_used;
         const ep = encodeURIComponent(a.path);
         const en = a.name.replace(/'/g, "\\'").replace(/"/g, '&quot;');
-        const rmBtn = (a.is_unused || a.is_unknown) ? '<button class="app-uninstall-btn" onclick="uninstallApp(this,\'' + ep + '\',\'' + en + '\')">Remove</button>' : '';
+        const rmBtn = a.is_unused ? '<button class="app-uninstall-btn" onclick="uninstallApp(this,\'' + ep + '\',\'' + en + '\')">Remove</button>' : '';
         return '<div class="app-row"><div class="app-name">' + a.name + '</div><div class="app-size">' + a.size_display + '</div><div class="app-date">' + lu + '</div><div class="app-status"><span class="app-status-badge ' + sc + '">' + st + '</span></div><div>' + rmBtn + '</div></div>';
     }).join('');
 }
