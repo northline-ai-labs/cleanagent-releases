@@ -18,7 +18,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install flask psutil pyinstaller
+          pip install -r requirements.txt pyinstaller
       - name: Build Windows .exe
         run: |
           pyinstaller cleanagent.spec --clean --noconfirm
@@ -64,20 +64,28 @@ jobs:
   # ═══════════════════════════════════════════════════════════════
   build-mac:
     runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            prefix: ""
+          - arch: intel
+            prefix: "arch -x86_64"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python (x86_64 via Rosetta for Intel compatibility)
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies (x86_64)
+      - name: Install dependencies (${{ matrix.arch }})
         run: |
-          arch -x86_64 pip install --upgrade pip
-          arch -x86_64 pip install -r requirements.txt
-          arch -x86_64 pip install pyinstaller
+          ${{ matrix.prefix }} pip install --upgrade pip
+          ${{ matrix.prefix }} pip install -r requirements.txt
+          ${{ matrix.prefix }} pip install pyinstaller
 
       - name: Create entitlements file
         run: |
@@ -98,7 +106,7 @@ jobs:
 
       - name: Build with PyInstaller
         run: |
-          arch -x86_64 pyinstaller --name CleanAgent \
+          ${{ matrix.prefix }} pyinstaller --name CleanAgent \
             --windowed \
             --onedir \
             --osx-bundle-identifier io.cleanagent.app \
@@ -381,11 +389,17 @@ jobs:
         run: |
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
 
+      - name: Rename DMG for architecture
+        run: |
+          mv dist/CleanAgent.dmg dist/CleanAgent-${{ matrix.arch }}.dmg
+          echo "=== Built architecture ==="
+          file dist/CleanAgent/CleanAgent 2>/dev/null || true
+
       - name: Upload Mac artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CleanAgent-Mac
-          path: dist/CleanAgent.dmg
+          name: CleanAgent-Mac-${{ matrix.arch }}
+          path: dist/CleanAgent-${{ matrix.arch }}.dmg
           retention-days: 90
   release:
     needs: [build-windows, build-mac]
@@ -400,8 +414,12 @@ jobs:
       - name: Download Mac artifact
         uses: actions/download-artifact@v4
         with:
-          name: CleanAgent-Mac
+          pattern: CleanAgent-Mac-*
+          merge-multiple: true
           path: ./release
+      - name: Keep legacy CleanAgent.dmg download link working
+        run: cp ./release/CleanAgent-intel.dmg ./release/CleanAgent.dmg
+
       - name: List release files
         run: ls -lh ./release/
       - name: Create GitHub Release
@@ -410,4 +428,6 @@ jobs:
           files: |
             ./release/CleanAgent.exe
             ./release/CleanAgent.dmg
+            ./release/CleanAgent-arm64.dmg
+            ./release/CleanAgent-intel.dmg
           generate_release_notes: true
