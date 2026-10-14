@@ -324,6 +324,59 @@ def archive_status(job_id):
     return jsonify(job)
 
 
+class _Bridge:
+    """In-process bridge: the window calls Flask routes directly. No server, no port."""
+    def request(self, method, path, body=None):
+        import json as _json
+        try:
+            with app.test_client() as c:
+                kw = {"method": method}
+                if body is not None:
+                    kw["data"] = body
+                    kw["content_type"] = "application/json"
+                r = c.open(path, **kw)
+                return {"status": r.status_code,
+                        "body": r.get_data(as_text=True),
+                        "ctype": r.content_type or "application/json"}
+        except Exception as e:
+            log.error(f"bridge error {method} {path}: {e}", exc_info=True)
+            return {"status": 500, "body": _json.dumps({"error": str(e)}),
+                    "ctype": "application/json"}
+
+
+_FETCH_SHIM = """<script>
+/* Route same-app fetch('/...') calls to Python in-process (no local server) */
+(function () {
+  var realFetch = window.fetch ? window.fetch.bind(window) : null;
+  function bridgeReady() {
+    return new Promise(function (res) {
+      if (window.pywebview && window.pywebview.api && window.pywebview.api.request) return res();
+      window.addEventListener('pywebviewready', function () { res(); }, { once: true });
+    });
+  }
+  window.fetch = async function (input, init) {
+    var url = typeof input === 'string' ? input : (input && input.url) || '';
+    if (url.charAt(0) !== '/') return realFetch(input, init);
+    init = init || {};
+    await bridgeReady();
+    var body = init.body == null ? null : (typeof init.body === 'string' ? init.body : JSON.stringify(init.body));
+    var r = await window.pywebview.api.request((init.method || 'GET').toUpperCase(), url, body);
+    return new Response(r.body, { status: r.status, headers: { 'Content-Type': r.ctype } });
+  };
+})();
+</script>"""
+
+
+def _render_index() -> str:
+    import re
+    with app.test_client() as c:
+        html = c.get("/").get_data(as_text=True)
+    m = re.search(r"<head[^>]*>", html, re.I)
+    if m:
+        return html[:m.end()] + _FETCH_SHIM + html[m.end():]
+    return _FETCH_SHIM + html
+
+
 def _free_port() -> int:
     import socket
     s = socket.socket()
@@ -333,43 +386,29 @@ def _free_port() -> int:
     return port
 
 
-def _wait_for_server(url: str, timeout: float = 15) -> bool:
-    import time, urllib.request, urllib.error
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            urllib.request.urlopen(url, timeout=1)
-            return True
-        except urllib.error.HTTPError:
-            return True          # server is up, route just returned an error code
-        except Exception:
-            time.sleep(0.2)
-    return False
+def _run_server_with_browser():
+    """Dev/fallback mode only: local server + default browser."""
+    port = int(os.environ.get("PORT", 0)) or _free_port()
+    url = f"http://127.0.0.1:{port}"
+    log.info(f"CleanAgent (server mode) on {url}")
+    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
-    # Avoid port 5000: macOS AirPlay Receiver uses it on many Macs
-    port = int(os.environ.get("PORT", 0)) or _free_port()
-    url = f"http://127.0.0.1:{port}"
-    log.info(f"CleanAgent starting on {url}")
-
-    server = threading.Thread(
-        target=lambda: app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False),
-        daemon=True,
-    )
-    server.start()
-    _wait_for_server(url)
-
     try:
         import webview
     except ImportError:
         webview = None
 
-    if webview:
-        # Native app window; closing it quits CleanAgent (server thread is a daemon)
-        webview.create_window("CleanAgent", url, width=1200, height=800, min_size=(900, 600))
+    if webview and not os.environ.get("CLEANAGENT_SERVER"):
+        log.info("CleanAgent starting (native window, no local server)")
+        webview.create_window(
+            "CleanAgent",
+            html=_render_index(),
+            js_api=_Bridge(),
+            width=1200, height=800, min_size=(900, 600),
+        )
         webview.start()
     else:
-        log.warning("pywebview not installed; falling back to browser")
-        webbrowser.open(url)
-        server.join()
+        _run_server_with_browser()
